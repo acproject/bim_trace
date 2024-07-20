@@ -42,7 +42,34 @@ kalman_filter.transitionMatrix = np.array([[1, 0, 0, 1, 0, 0],
                                            [0, 0, 0, 0, 0, 1]], dtype=np.float32)
 kalman_filter.measurementMatrix = np.eye(3, 6, dtype=np.float32)
 kalman_filter.processNoiseCov = np.eye(6, dtype=np.float32) * 0.03
+def load_images():
+    """
+    从摄像头捕获图像，并将图像转换为numpy数组格式。
 
+    返回值：
+    images: list，包含多张图像的列表。
+    """
+    cap = cv2.VideoCapture(0)  # 初始化摄像头
+    images = []
+    while True:
+        ret, frame = cap.read()  # 读取一帧图像
+        if not ret:
+            break
+        images.append(frame)
+    cap.release()
+    return images
+
+
+def load_model_edges():
+    """
+    加载模型边信息，通常是从预训练模型或特定数据集中提取的边缘信息。
+
+    返回值：
+    model_edges: ndarray，模型边的数组。
+    """
+    # 这里假设我们有一个预定义的模型边数组
+    model_edges = np.array([[1, 2], [3, 4], [5, 6]])  # 示例数组，实际应用中应替换为真实数据
+    return model_edges
 # 主循环
 images = load_images()  # 通过摄像头进行获取图像
 model_edges = load_model_edges() # 获得模型边
