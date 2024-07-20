@@ -44,8 +44,8 @@ kalman_filter.measurementMatrix = np.eye(3, 6, dtype=np.float32)
 kalman_filter.processNoiseCov = np.eye(6, dtype=np.float32) * 0.03
 
 # 主循环
-images = load_images()
-model_edges = load_model_edges()
+images = load_images()  # 通过摄像头进行获取图像
+model_edges = load_model_edges() # 获得模型边
 
 for frame in images:
     # 图像预处理

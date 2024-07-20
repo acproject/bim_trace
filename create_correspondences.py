@@ -26,6 +26,9 @@
 import numpy as np
 import cv2
 
+from world_to_pixel import world_to_pixel
+
+
 def create_correspondences(visible_edges, R, t, edge_image, f, min_line_length, search_len, seg_line_length, IRx, IRy, IPPM):
     A, B = [], []
     correspondence_final = []

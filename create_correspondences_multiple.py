@@ -16,10 +16,7 @@
 import numpy as np
 from scipy.ndimage import label
 
-def world_to_pixel(f, point_3d, R, t, IRx, IRy, IPRM):
-    # This function should implement the transformation from world coordinates to pixel coordinates.
-    # Since it's not provided, we'll assume it's a placeholder for actual transformation logic.
-    pass
+from world_to_pixel import world_to_pixel
 
 
 def create_correspondences_multiple(visible_edges, R, t, edgeim, MinSegmentLength, SearchLength,
