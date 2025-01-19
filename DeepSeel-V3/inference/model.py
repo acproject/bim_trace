@@ -606,4 +606,373 @@ class MLA(nn.Module):
         x = self.wo(x.flatten(2))
         return x
 
+class MLP(nn.Module):
+    """
+    初始化一个简单的多层感知器（MLP）类，该类继承自nn.Module。
+    这个MLP类特别之处在于它使用了并行线性层，适合于并行计算的场景。
+       Attributes:
+        w1 (nn.Module): Linear layer for input-to-hidden transformation.
+        w2 (nn.Module): Linear layer for hidden-to-output transformation.
+        w3 (nn.Module): Additional linear layer for feature transformation.
+    参数:
+    - dim (int): 输入和输出维度。
+    - inter_dim (int): 中间层的维度。
+    """
+    def __init__(self, dim:int, inter_dim: int):
+        # 初始化父类
+        super().__init__()
+        # 定义第一个线性层，列并行
+        self.w1 = ColumnParallelLinear(dim, inter_dim)
+        # 定义第二个线性层，行并行
+        self.w2 = RowParallelLinear(inter_dim, dim)
+        # 定义第三个线性层，列并行
+        self.w3 = ColumnParallelLinear(dim, inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        定义MLP的前向传播过程。
+
+        参数:
+        - x (torch.Tensor): 输入张量。
+
+        返回:
+        - torch.Tensor: 经过MLP处理后的输出张量。
+        """
+        # 使用silu激活函数处理w1的输出，并与w3的输出相乘，然后将结果通过w2
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+class Gate(nn.Module):
+    """
+    门控模块，用于选择最合适的专家网络。
+
+    该模块根据输入数据的特征，通过计算得分来选择最合适的专家网络。它支持不同的打分函数和选择策略，
+    以适应不同的应用场景和需求。
+    Attributes:
+        dim (int): Dimensionality of input features.
+        topk (int): Number of top experts activated for each input.
+        n_groups (int): Number of groups for routing.
+        topk_groups (int): Number of groups to route inputs to.
+        score_func (str): Scoring function ('softmax' or 'sigmoid').
+        route_scale (float): Scaling factor for routing weights.
+        weight (torch.nn.Parameter): Learnable weights for the gate.
+        bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
+
+    参数:
+    - args: 包含模型参数的命名元组，如维度(dim)、激活的专家数(n_activated_experts)等。
+    """
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        # 初始化模型维度、顶级专家数、专家组数等参数
+        self.dim = args.dim
+        self.topk = args.n_activated_experts
+        self.n_groups = args.n_expert_groups
+        self.topk_groups = args.n_limited_groups
+        self.score_func = args.score_func
+        self.route_scale = args.route_scale
+        # 初始化权重参数，用于计算输入数据的得分
+        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
+        # 根据维度条件初始化偏置参数
+        self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        前向传播函数，计算输入数据的得分，并选择最合适的专家网络。
+
+        参数:
+        - x: 输入数据张量。
+
+        返回:
+        - weights: 选择的专家网络的权重。
+        - indices: 选择的专家网络的索引。
+        Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
+        """
+        # 计算输入数据的得分
+        scores = linear(x, self.weight)
+        # 根据配置的打分函数，对得分进行softmax或sigmoid处理
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1, dtype=torch.float32)
+        else:
+            scores = torch.sigmoid(scores)
+        original_scores = scores
+        # 如果配置了偏置参数，则加上偏置
+        if self.bias is not None:
+            scores = scores + self.bias
+        # 如果有多个专家组，进行组间选择
+        if self.n_groups > 1:
+            scores = scores.view(x.size(0), self.n_groups, -1)
+            # 根据是否存在偏置参数，选择不同的策略计算组得分
+            if self.bias is None:
+                group_scores = scores.amax(dim=-1)
+            else:
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+            # 选择得分最高的几个组
+            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+            '''
+                创建一个与 scores 的第一个维度形状相同的零张量。
+                使用 scatter_ 方法将 indices 指定位置的值设置为 True。
+            '''
+            mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
+            scores = (scores * mask.unsqueeze(-1)).flatten(1)
+        # 在每个组内选择得分最高的几个专家
+        indices = torch.topk(scores, self.topk, dim=-1)[1]
+        weights = original_scores.gather(1, indices)
+        # 如果使用sigmoid打分函数，对权重进行归一化
+        if self.score_func == "sigmoid":
+            weights /= weights.sum(dim=-1, keepdim=True)
+        # 对权重进行缩放
+        weights *= self.route_scale
+        # 返回选择的专家的权重和索引
+        return weights.type_as(x), indices
+
+class Expert(nn.Module):
+    """
+    专家网络类，继承自nn.Module。
+
+    该类实现了一个前馈神经网络，包含两个输入输出维度相同的线性变换和一个中间层。
+    使用SiLU激活函数来引入非线性，并通过元素级乘法结合另一个线性变换的结果。
+    Attributes:
+        w1 (nn.Module): Linear layer for input-to-hidden transformation.
+        w2 (nn.Module): Linear layer for hidden-to-output transformation.
+        w3 (nn.Module): Additional linear layer for feature transformation.
+    参数:
+    - dim (int): 输入和输出维度。
+    - inter_dim (int): 中间层的维度。
+    """
+    def __init__(self, dim: int, inter_dim: int):
+        """
+        初始化专家网络。
+
+        初始化三个线性层，这些层将在前向传播中使用。
+        """
+        super().__init__()
+        self.w1 = Linear(dim, inter_dim)  # 第一个线性层，从输入维度变换到中间维度
+        self.w2 = Linear(inter_dim, dim)  # 第二个线性层，从中间维度变换回输入维度
+        self.w3 = Linear(dim, inter_dim)  # 第三个线性层，与第一个线性层类似，用于不同的变换路径
+
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        """
+        前向传播函数。
+
+        实现了输入张量的前向传播过程，包括通过第一个线性层后的SiLU激活，以及与第三个线性层输出的元素级乘法，
+        最后通过第二个线性层输出结果。
+
+        参数:
+        - x (torch.Tensor): 输入张量。
+
+        返回:
+        - torch.Tensor: 前向传播后的输出张量。
+        """
+        # 使用SiLU激活函数处理第一个线性层的输出，并与第三个线性层的输出进行元素级乘法，最后通过第二个线性层
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+class MoE(nn.Module):
+    """
+    MoE (Mixture of Experts) 模型定义。
+
+    该类实现了混合专家模型，其中包括门控机制和多个专家网络。
+
+    参数:
+    - args: 包含模型参数的命名元组，如维度、专家数量等。
+    """
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        # 初始化模型维度
+        self.dim = args.dim
+        # 确保全局专家数量能被世界大小整除
+        assert args.n_routed_experts % world_size == 0
+        # 计算每个设备上的专家数量
+        self.n_routed_experts = args.n_routed_experts
+        self.n_local_experts = args.n_routed_experts // world_size
+        self.n_activated_experts = args.n_activated_experts
+        # 根据当前设备的rank计算本地专家的起始索引
+        self.experts_start_idx = rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        # 初始化门控机制
+        self.gate = Gate(args)
+        # 初始化专家网络列表
+        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim)
+                                      if self.experts_start_idx <= i < self.experts_end_idx
+                                      else None for i in range(self.n_routed_experts)])
+        # 初始化共享专家网络
+        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        MoE 模型的前向传播函数。
+        Attributes:
+            dim (int): Dimensionality of input features.
+            n_routed_experts (int): Total number of experts in the model.
+            n_local_experts (int): Number of experts handled locally in distributed systems.
+            n_activated_experts (int): Number of experts activated for each input.
+            gate (nn.Module): Gating mechanism to route inputs to experts.
+            experts (nn.ModuleList): List of expert modules.
+            shared_experts (nn.Module): Shared experts applied to all inputs.
+        参数:
+        - x: 输入张量。
+
+        返回:
+        - 经过专家网络和门控机制处理后的输出张量。
+        """
+        # 保存输入张量的形状以便于后续重塑输出张量
+        shape = x.size()
+        # 将输入张量重塑为二维张量以适应模型的输入要求
+        x = x.view(-1, self.dim)
+        # 使用门控机制为每个样本选择专家
+        weights, indices = self.gate(x)
+        # 初始化输出张量
+        y = torch.zeros_like(x)
+        # 统计每个专家被选中的次数
+        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+        # 遍历每个本地专家
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            # 如果当前专家未被选中，则跳过
+            if counts[i] == 0:
+                continue
+            # 获取当前专家网络
+            expert = self.experts[i]
+            # 找出所有选择当前专家的样本索引
+            idx, top = torch.where(indices == i)
+            # 使用当前专家处理相应的样本，并根据门控权重更新输出张量
+            y[idx] += expert(x[idx]) * weights[idx, top, None]
+        # 使用共享专家网络处理所有样本
+        z = self.shared_experts(x)
+        # 如果使用多设备，则对输出张量执行全归约操作
+        if world_size > 1:
+            dist.all_reduce(y)
+        # 将专家网络的输出和共享专家网络的输出相加，并重塑为输入张量的形状
+        return (y + z).view(shape)
+
+
+class Bloak(nn.Module):
+    """
+      Transformer block combining attention and feed-forward layers.
+
+    Attributes:
+        attn (nn.Module): Attention layer (MLA).
+        ffn (nn.Module): Feed-forward network (MLP or MoE).
+        attn_norm (nn.Module): Layer normalization for attention.
+        ffn_norm (nn.Module): Layer normalization for feed-forward network.
+    Bloak是继承自nn.Module的自定义神经网络块。
+    它结合了多层注意力机制（MLA）和前馈网络（FFN），并根据层的标识决定使用密集层还是专家混合层（MoE）。
+
+    参数:
+    - layer_id: int, 层的唯一标识，用于确定是否使用密集层。
+    - args: ModelArgs, 包含模型参数的对象，如维度、密集层数量等。
+    """
+    def __init__(self, layer_id:int ,args: ModelArgs):
+        super().__init__()
+        # 初始化多层注意力机制
+        self.attn = MLA(args)
+        # 根据层标识初始化前馈网络或专家混合层
+        self.ffn = MLP(args.dim, args.inter_fim) if layer_id < args.n_dense_layers else MoE(args)
+        # 初始化注意力层和前馈层的归一化层
+        self.attn_norm = RMSNorm(args.dim)
+        self.ffn_norm = RMSNorm(args.dim)
+
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        Bloak的前向传播方法。
+
+        参数:
+        - x: torch.Tensor, 输入张量。
+        - start_pos: int, 开始位置，用于注意力机制。
+        - freqs_cis: torch.Tensor, 频率张量，用于注意力机制中的复杂乘法。
+        - mask: Optional[torch.Tensor], 可选的掩码张量，用于注意力机制中对某些位置进行掩码。
+
+        返回:
+        - torch.Tensor, 经过注意力机制和前馈网络处理后的输出张量。
+        """
+        # 注意力层和前馈层的残差连接
+        x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+class Transformer(nn.Module):
+    """
+       Transformer模型类，继承自nn.Module。
+
+       该类主要负责处理文本数据，使用Transformer架构进行自然语言处理任务。
+       它包括嵌入层、多个Transformer块、规范化层和输出层。
+
+       参数:
+       - args: ModelArgs类型，包含模型的各种参数，如词汇表大小、维度、最大序列长度等。
+
+       属性:
+       - max_seq_len: int类型，模型能够处理的最大序列长度。
+       - embed: ParallelEmbedding类型，词嵌入层。
+       - layers: nn.ModuleList类型，包含多个Transformer块。
+       - norm: RMSNorm类型，规范化层。
+       - head: ColumnParallelLinear类型，输出层。
+       - freqs_cis: 预先计算的频率复杂表示，用于注意力机制。
+    """
+    def __init__(self, args: ModelArgs):
+        global world_size, rank
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        Linear.dtype = torch.float8_e4m3fn if args.dtype == 'fp8' else torch.bfloat16
+        super().__init__()
+        self.max_seq_len = args.max_seq_len
+        self.embed = ParallelEmbedding(args.vocab_size, args.dim)
+        self.layers = nn.ModuleList()
+        for layer_id in range(args.n_layers):
+            self.layers.append(Bloak(layer_id, args))
+        self.norm = RMSNorm(args.dim)
+        self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
+        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        """
+              Transformer模型的前向传播函数。
+
+              参数:
+              - tokens: torch.Tensor类型，输入的文本数据，形状为(batch_size, sequence_length)。
+              - start_pos: int类型，开始位置的索引，默认为0。
+
+              返回:
+              - logits: torch.Tensor类型，模型的输出，形状为(batch_size, vocab_size)。
+        """
+        seqlen = tokens.size(1)
+        h = self.embed(tokens)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        mask = None
+        if seqlen > 1:
+            '''
+                段代码的功能是生成一个上三角矩阵作为掩码（mask），用于Transformer模型中的自注意力机制。具体步骤如下：
+                    使用 torch.full 创建一个形状为 (seqlen, seqlen) 的矩阵，初始值为负无穷大。
+                    使用 .triu_(1) 将该矩阵转换为上三角矩阵，对角线及其以下元素保持不变，对角线上方的元素保留为负无穷大。
+                    这个掩码矩阵用于防止在自注意力计算中看到未来的信息。
+                    ```mermaid
+                        flowchart TD
+                        A[开始] --> B[创建全为负无穷大的矩阵]
+                        B --> C[将矩阵转换为上三角矩阵]
+                        C --> D[结
+                    ```
+                    解释
+                        开始：表示流程的起点。
+                        创建全为负无穷大的矩阵：使用 torch.full 创建一个形状为 (seqlen, seqlen) 的矩阵，初始值为负无穷大。
+                        将矩阵转换为上三角矩阵：使用 .triu_(1) 方法将矩阵转换为上三角矩阵。
+                        结束：表示流程的终点。
+                        通过这个流程，最终生成了一个用于自注意力机制的掩码矩阵。
+            '''
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)[:, -1]
+        logits = self.head(h)
+        if world_size > 1:
+            all_logits = [torch.empty_like(logits) for  _ in range(world_size)]
+            dist.all_gather(all_logits, logits)
+            logits = torch.cat(all_logits, dim=-1)
+        return logits
+
+
+if __name__ == '__main__':
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device('cuda')
+    torch.manual_seed(0)
+    args = ModelArgs()
+    x = torch.randint(0, args.vocab_size, (2, 128))
+    model = Transformer(args)
+    print(model(x).size())
 
